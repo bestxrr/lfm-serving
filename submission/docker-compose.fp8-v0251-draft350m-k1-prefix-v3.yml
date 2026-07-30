@@ -1,10 +1,9 @@
 services:
   model:
-    image: siconhoccode/lfm-serving:fp8-v0251-draft350m-k1-prefix-v2
+    image: siconhoccode/lfm-serving:fp8-v0251-draft350m-k1-prefix-v3
     entrypoint:
       - python3
-      - -m
-      - vllm.entrypoints.openai.api_server
+      - /opt/lfm/warmup_entrypoint.py
     command:
       - --model=/model
       - --served-model-name=LFM2.5-1.2B-Instruct
@@ -23,6 +22,11 @@ services:
       - --speculative-config={"method":"draft_model","model":"/draft-model","num_speculative_tokens":1,"draft_tensor_parallel_size":1}
       - --disable-log-stats
       - --disable-uvicorn-access-log
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /tmp/lfm-warmup-ready"]
+      interval: 2s
+      timeout: 1s
+      retries: 120
     ports:
       - "8000:8000"
     shm_size: "2g"

@@ -11,7 +11,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/* \
     && pip install --no-cache-dir xxhash
 
-COPY submission/patches/vllm-0.25.1-lfm2-draft-prefix-v10.patch /tmp/lfm2-draft.patch
+COPY submission/patches/vllm-0.25.1-lfm2-draft-prefix-v11.patch /tmp/lfm2-draft.patch
 
 RUN site_packages="$(python3 -c 'import pathlib, vllm; print(pathlib.Path(vllm.__file__).parent.parent)')" \
     && patch -d "${site_packages}" -p1 < /tmp/lfm2-draft.patch \
@@ -31,10 +31,14 @@ RUN site_packages="$(python3 -c 'import pathlib, vllm; print(pathlib.Path(vllm._
 RUN python3 -c "from huggingface_hub import snapshot_download; snapshot_download('LiquidAI/LFM2.5-350M', revision='${DRAFT_REVISION}', local_dir='/draft-model')"
 
 COPY submission/model /model
+COPY submission/warmup_entrypoint.py /opt/lfm/warmup_entrypoint.py
 
 ENV HF_HUB_OFFLINE=1 \
     TRANSFORMERS_OFFLINE=1 \
     VLLM_NO_USAGE_STATS=1 \
-    DO_NOT_TRACK=1
+    DO_NOT_TRACK=1 \
+    LFM_DRAFT_WARMUP_BURST=1 \
+    LFM_WARMUP_START_TIMEOUT=180
 
 EXPOSE 8000
+ENTRYPOINT ["python3", "/opt/lfm/warmup_entrypoint.py"]

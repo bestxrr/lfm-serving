@@ -11,6 +11,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 
@@ -73,13 +74,15 @@ def main() -> int:
     warmups = [
         (64, 128, 0.0, 1.0),
         (64, 128, 0.7, 0.9),
-        (4400, 64, 0.0, 1.0),
-        (4400, 64, 0.7, 0.9),
+        (4400, 128, 0.0, 1.0),
+        (4400, 128, 0.7, 0.9),
     ]
     endpoint = f"http://127.0.0.1:{port}/v1/completions"
+    warmed_prompts: list[list[int]] = []
     for prompt_len, output_len, temperature, top_p in warmups:
         # Synthetic token IDs avoid polluting natural-language prefix entries.
         prompt_ids = [rng.randrange(1000, 60000) for _ in range(prompt_len)]
+        warmed_prompts.append(prompt_ids)
         request(
             endpoint,
             {
@@ -91,6 +94,33 @@ def main() -> int:
                 "ignore_eos": True,
             },
         )
+
+    if os.environ.get("LFM_DRAFT_WARMUP_BURST", "0") == "1":
+        # Exercise full-prefix-hit rows mixed with uncached rows before the
+        # container is declared ready. This is the production regression cell
+        # for the generic draft metadata request-set bug.
+        burst_prompts = [
+            warmed_prompts[-1],
+            warmed_prompts[-1],
+            [rng.randrange(1000, 60000) for _ in range(96)],
+            [rng.randrange(1000, 60000) for _ in range(128)],
+        ]
+
+        def burst_request(prompt_ids: list[int]) -> None:
+            request(
+                endpoint,
+                {
+                    "model": model,
+                    "prompt": prompt_ids,
+                    "max_tokens": 16,
+                    "temperature": 0,
+                    "ignore_eos": True,
+                },
+            )
+
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            list(pool.map(burst_request, burst_prompts))
+        print("Draft warmup burst complete: 4 concurrent requests", flush=True)
 
     # This endpoint is version-dependent; cache reset is hygiene, not readiness.
     try:
