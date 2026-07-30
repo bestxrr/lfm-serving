@@ -551,6 +551,48 @@ index b13c23d..48d8477 100644
      if vllm_config.scheduler_config.disable_hybrid_kv_cache_manager:
          unify_hybrid_kv_cache_specs(kv_cache_spec)
  
+diff --git a/vllm/v1/spec_decode/draft_model.py b/vllm/v1/spec_decode/draft_model.py
+index 08542f0..b8b20dc 100644
+--- a/vllm/v1/spec_decode/draft_model.py
++++ b/vllm/v1/spec_decode/draft_model.py
+@@ -1,6 +1,8 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
++import copy
++
+ import torch
+ import torch.nn as nn
+ from typing_extensions import override
+@@ -81,6 +83,19 @@ class DraftModelProposer(SpecDecodeBaseProposer):
+     def _create_draft_vllm_config(self) -> VllmConfig:
+         base = super()._create_draft_vllm_config()
+         spec = self.speculative_config
++        draft_model_config = spec.draft_model_config
++        if (
++            draft_model_config.quantization is not None
++            and not isinstance(draft_model_config.hf_overrides, dict)
++        ):
++            # The draft config has already materialized its HF config. The
++            # VllmConfig quant validator requires a dict override, while the
++            # speculative-config constructor normally leaves a callable here.
++            draft_model_config = copy.copy(draft_model_config)
++            draft_model_config.hf_overrides = {}
++            draft_model_config.quantization_config = (
++                spec.target_model_config.quantization_config
++            )
+ 
+         return replace(
+             base,
+@@ -89,7 +104,7 @@ class DraftModelProposer(SpecDecodeBaseProposer):
+                 spec.draft_parallel_config,
+                 rank=self.vllm_config.parallel_config.rank,
+             ),
+-            model_config=spec.draft_model_config,
++            model_config=draft_model_config,
+         )
+ 
+     @override
 diff --git a/vllm/v1/spec_decode/llm_base_proposer.py b/vllm/v1/spec_decode/llm_base_proposer.py
 index 756c5f3..916b121 100644
 --- a/vllm/v1/spec_decode/llm_base_proposer.py

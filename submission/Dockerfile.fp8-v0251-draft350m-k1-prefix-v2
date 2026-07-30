@@ -20,6 +20,7 @@ RUN site_packages="$(python3 -c 'import pathlib, vllm; print(pathlib.Path(vllm._
        "${site_packages}/vllm/model_executor/layers/mamba/short_conv.py" \
        "${site_packages}/vllm/v1/attention/backends/short_conv_attn.py" \
        "${site_packages}/vllm/v1/core/kv_cache_utils.py" \
+       "${site_packages}/vllm/v1/spec_decode/draft_model.py" \
        "${site_packages}/vllm/v1/spec_decode/llm_base_proposer.py" \
        "${site_packages}/vllm/v1/spec_decode/utils.py" \
        "${site_packages}/vllm/v1/worker/gpu_model_runner.py" \

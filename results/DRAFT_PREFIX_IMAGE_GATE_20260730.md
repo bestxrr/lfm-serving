@@ -76,7 +76,7 @@ BF16 and FP8 drafts. Do not submit this image as a performance candidate.
 - Patch:
   `submission/patches/vllm-0.25.1-lfm2-draft-prefix-v10.patch`
   - SHA256:
-    `fd1e7d977c62d4d2e120c97441cd786e72339e1dc1e40ddb3493860eb174f8a1`
+    `64df29959bce5f446ae26383fa81fcce836049b02305886b8217586bf6eb46de`
 - Dockerfile:
   `submission/Dockerfile.fp8-v0251-draft350m-k1-prefix-v2`
 - Compose:
