@@ -1,0 +1,35 @@
+services:
+  model:
+    image: siconhoccode/lfm-serving:fp8-v0251-draft350m-k1-prefix-v2
+    entrypoint:
+      - python3
+      - -m
+      - vllm.entrypoints.openai.api_server
+    command:
+      - --model=/model
+      - --served-model-name=LFM2.5-1.2B-Instruct
+      - --host=0.0.0.0
+      - --port=8000
+      - --dtype=bfloat16
+      - --quantization=fp8_per_tensor
+      - --max-model-len=5120
+      - --gpu-memory-utilization=0.70
+      - --tensor-parallel-size=1
+      - --max-num-seqs=8
+      - --max-num-batched-tokens=512
+      - --enable-prefix-caching
+      - --prefix-caching-hash-algo=xxhash
+      - --no-async-scheduling
+      - --speculative-config={"method":"draft_model","model":"/draft-model","num_speculative_tokens":1,"draft_tensor_parallel_size":1}
+      - --disable-log-stats
+      - --disable-uvicorn-access-log
+    ports:
+      - "8000:8000"
+    shm_size: "2g"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]

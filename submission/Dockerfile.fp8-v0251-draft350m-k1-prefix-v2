@@ -1,0 +1,39 @@
+# Production candidate: vLLM 0.25.1 FP8 target with a BF16
+# LFM2.5-350M generic hybrid draft, prefix caching, and CUDA graphs.
+# Build from the repository root after placing the target checkpoint in
+# submission/model/.
+FROM vllm/vllm-openai:v0.25.1
+
+ARG DRAFT_REVISION=b9d6e4e2d75f440b12a2b4d731c808004ecbbd89
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends patch \
+    && rm -rf /var/lib/apt/lists/* \
+    && pip install --no-cache-dir xxhash
+
+COPY submission/patches/vllm-0.25.1-lfm2-draft-prefix-v9.patch /tmp/lfm2-draft.patch
+
+RUN site_packages="$(python3 -c 'import pathlib, vllm; print(pathlib.Path(vllm.__file__).parent.parent)')" \
+    && patch -d "${site_packages}" -p1 < /tmp/lfm2-draft.patch \
+    && rm /tmp/lfm2-draft.patch \
+    && python3 -m py_compile \
+       "${site_packages}/vllm/model_executor/layers/mamba/short_conv.py" \
+       "${site_packages}/vllm/v1/attention/backends/short_conv_attn.py" \
+       "${site_packages}/vllm/v1/core/kv_cache_utils.py" \
+       "${site_packages}/vllm/v1/spec_decode/llm_base_proposer.py" \
+       "${site_packages}/vllm/v1/spec_decode/utils.py" \
+       "${site_packages}/vllm/v1/worker/gpu_model_runner.py" \
+       "${site_packages}/vllm/v1/worker/mamba_utils.py"
+
+# The draft is pinned and baked into the image; only the target checkpoint
+# needs to exist in submission/model in the GCP checkout.
+RUN python3 -c "from huggingface_hub import snapshot_download; snapshot_download('LiquidAI/LFM2.5-350M', revision='${DRAFT_REVISION}', local_dir='/draft-model')"
+
+COPY submission/model /model
+
+ENV HF_HUB_OFFLINE=1 \
+    TRANSFORMERS_OFFLINE=1 \
+    VLLM_NO_USAGE_STATS=1 \
+    DO_NOT_TRACK=1
+
+EXPOSE 8000
