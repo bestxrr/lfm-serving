@@ -1,0 +1,1828 @@
+diff --git a/vllm/model_executor/layers/mamba/short_conv.py b/vllm/model_executor/layers/mamba/short_conv.py
+index e7e36f2..cc3098d 100644
+--- a/vllm/model_executor/layers/mamba/short_conv.py
++++ b/vllm/model_executor/layers/mamba/short_conv.py
+@@ -2,7 +2,10 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
+ 
++import os
++
+ import torch
++import torch.nn.functional as F
+ 
+ from vllm.config import CacheConfig, ModelConfig, get_current_vllm_config
+ from vllm.distributed import get_tensor_model_parallel_world_size
+@@ -24,12 +27,239 @@ from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
+     causal_conv1d_update,
+ )
+ from vllm.platforms import current_platform
++from vllm.triton_utils import tl, triton
+ from vllm.utils.torch_utils import direct_register_custom_op
+ from vllm.v1.attention.backend import AttentionMetadata
+ from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
+ from vllm.v1.attention.backends.short_conv_attn import ShortConvAttentionMetadata
+ 
+ 
++@triton.jit
++def _draft_conv_qlen12_kernel(
++    x,
++    state,
++    weight,
++    bias,
++    query_start_loc,
++    state_indices,
++    output,
++    stride_x_token: tl.constexpr,
++    stride_x_dim: tl.constexpr,
++    stride_state_slot: tl.constexpr,
++    stride_state_dim: tl.constexpr,
++    stride_state_token: tl.constexpr,
++    stride_weight_dim: tl.constexpr,
++    stride_weight_token: tl.constexpr,
++    stride_state_indices: tl.constexpr,
++    stride_output_token: tl.constexpr,
++    stride_output_dim: tl.constexpr,
++    dim: tl.constexpr,
++    BLOCK: tl.constexpr,
++    HAS_BIAS: tl.constexpr,
++):
++    request = tl.program_id(0)
++    channels = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
++    mask = channels < dim
++    start = tl.load(query_start_loc + request)
++    end = tl.load(query_start_loc + request + 1)
++    qlen = end - start
++    slot = tl.load(state_indices + request * stride_state_indices)
++
++    state_base = (
++        state
++        + slot * stride_state_slot
++        + channels * stride_state_dim
++    )
++    s0 = tl.load(state_base, mask=mask, other=0.0)
++    s1 = tl.load(state_base + stride_state_token, mask=mask, other=0.0)
++    t0 = tl.load(
++        x + start * stride_x_token + channels * stride_x_dim,
++        mask=mask,
++        other=0.0,
++    )
++    weight_base = weight + channels * stride_weight_dim
++    w0 = tl.load(weight_base, mask=mask, other=0.0)
++    w1 = tl.load(weight_base + stride_weight_token, mask=mask, other=0.0)
++    w2 = tl.load(weight_base + 2 * stride_weight_token, mask=mask, other=0.0)
++    acc0 = tl.zeros((BLOCK,), dtype=tl.float32)
++    if HAS_BIAS:
++        acc0 = tl.load(bias + channels, mask=mask, other=0.0).to(tl.float32)
++    acc0 += s0 * w0
++    acc0 += s1 * w1
++    acc0 += t0 * w2
++    tl.store(
++        output + start * stride_output_token + channels * stride_output_dim,
++        acc0,
++        mask=mask,
++    )
++
++    if qlen == 2:
++        t1 = tl.load(
++            x + (start + 1) * stride_x_token + channels * stride_x_dim,
++            mask=mask,
++            other=0.0,
++        )
++        acc1 = tl.zeros((BLOCK,), dtype=tl.float32)
++        if HAS_BIAS:
++            acc1 = tl.load(bias + channels, mask=mask, other=0.0).to(tl.float32)
++        acc1 += s1 * w0
++        acc1 += t0 * w1
++        acc1 += t1 * w2
++        tl.store(
++            output
++            + (start + 1) * stride_output_token
++            + channels * stride_output_dim,
++            acc1,
++            mask=mask,
++        )
++        tl.store(state_base, t0, mask=mask)
++        tl.store(state_base + stride_state_token, t1, mask=mask)
++    else:
++        tl.store(state_base, s1, mask=mask)
++        tl.store(state_base + stride_state_token, t0, mask=mask)
++
++
++def specialized_draft_conv_replay(
++    x: torch.Tensor,
++    conv_state: torch.Tensor,
++    weight: torch.Tensor,
++    bias: torch.Tensor | None,
++    state_indices: torch.Tensor,
++    query_start_loc: torch.Tensor,
++) -> torch.Tensor:
++    assert conv_state.shape[-1] == 2 and weight.shape[-1] == 3
++    output = torch.empty_like(x)
++    batch_size = query_start_loc.numel() - 1
++    grid = (batch_size, triton.cdiv(x.shape[1], 256))
++    _draft_conv_qlen12_kernel[grid](
++        x,
++        conv_state,
++        weight,
++        bias,
++        query_start_loc,
++        state_indices[:, 0],
++        output,
++        x.stride(0),
++        x.stride(1),
++        conv_state.stride(0),
++        conv_state.stride(1),
++        conv_state.stride(2),
++        weight.stride(0),
++        weight.stride(1),
++        state_indices.stride(0),
++        output.stride(0),
++        output.stride(1),
++        dim=x.shape[1],
++        BLOCK=256,
++        HAS_BIAS=bias is not None,
++    )
++    return output
++
++
++def materialized_draft_conv_replay(
++    x: torch.Tensor,
++    conv_state: torch.Tensor,
++    weight: torch.Tensor,
++    bias: torch.Tensor | None,
++    state_indices: torch.Tensor,
++    query_start_loc: torch.Tensor,
++) -> torch.Tensor:
++    """Replay committed draft rows without aliasing persistent conv state."""
++    state_len = conv_state.shape[-1]
++    query_lens = torch.diff(query_start_loc)
++    batch_size = query_lens.numel()
++    num_tokens = x.shape[0]
++    device = x.device
++
++    request_ids = torch.arange(batch_size, device=device, dtype=torch.long)
++    token_request_ids = torch.repeat_interleave(
++        request_ids, query_lens.to(torch.long)
++    )
++    token_offsets = torch.arange(num_tokens, device=device) - query_start_loc[
++        :-1
++    ].to(torch.long).index_select(0, token_request_ids)
++
++    max_query_len = state_indices.shape[1]
++    dense = torch.zeros(
++        (batch_size, x.shape[1], state_len + max_query_len),
++        dtype=x.dtype,
++        device=device,
++    )
++    persistent_slots = state_indices[:, 0].to(torch.long)
++    dense[:, :, :state_len].copy_(
++        conv_state.index_select(0, persistent_slots)
++    )
++    dense[
++        token_request_ids, :, state_len + token_offsets
++    ] = x
++
++    dense_output = F.conv1d(
++        dense,
++        weight.unsqueeze(1),
++        bias,
++        groups=x.shape[1],
++    ).transpose(1, 2)
++    real_output = dense_output[token_request_ids, token_offsets]
++
++    tail_offsets = query_lens.to(torch.long).unsqueeze(1) + torch.arange(
++        state_len, device=device
++    )
++    new_state = dense.transpose(1, 2)[
++        request_ids.unsqueeze(1), tail_offsets
++    ].transpose(1, 2)
++    conv_state.index_copy_(
++        0, persistent_slots, new_state.to(conv_state.dtype)
++    )
++    return real_output
++
++
++def batched_draft_conv_replay(
++    x: torch.Tensor,
++    conv_state: torch.Tensor,
++    weight: torch.Tensor,
++    bias: torch.Tensor | None,
++    state_indices: torch.Tensor,
++    query_start_loc: torch.Tensor,
++) -> torch.Tensor:
++    """Replay qlen-1/2 draft rows in at most two ordinary update calls."""
++    query_lens = torch.diff(query_start_loc)
++    batch_size = query_lens.numel()
++    first_token_indices = query_start_loc[:-1].to(torch.long)
++    persistent_slots = state_indices[:, 0]
++    first_output = causal_conv1d_update(
++        x.index_select(0, first_token_indices),
++        conv_state,
++        weight,
++        bias,
++        activation=None,
++        conv_state_indices=persistent_slots,
++    )
++
++    has_second = query_lens == 2
++    second_token_indices = first_token_indices + has_second.to(torch.long)
++    second_slots = torch.where(
++        has_second, persistent_slots, torch.zeros_like(persistent_slots)
++    )
++    second_output = causal_conv1d_update(
++        x.index_select(0, second_token_indices),
++        conv_state,
++        weight,
++        bias,
++        activation=None,
++        conv_state_indices=second_slots,
++    )
++
++    request_ids = torch.arange(batch_size, device=x.device, dtype=torch.long)
++    token_request_ids = torch.repeat_interleave(
++        request_ids, query_lens.to(torch.long)
++    )
++    token_offsets = torch.arange(x.shape[0], device=x.device) - (
++        first_token_indices.index_select(0, token_request_ids)
++    )
++    per_request_output = torch.stack((first_output, second_output), dim=1)
++    return per_request_output[token_request_ids, token_offsets]
++
++
+ # --8<-- [start:short_conv]
+ @CustomOp.register("short_conv")
+ class ShortConv(MambaBase, CustomOp):
+@@ -262,6 +492,12 @@ class ShortConv(MambaBase, CustomOp):
+ 
+         if has_prefill:
+             Bx_p = (B_p * x_p).transpose(0, 1)
++            conv_metadata = attn_metadata
++            if (
++                attn_metadata.draft_replay_canonical
++                and os.getenv("LFM2_DRAFT_PREFILL_NO_METADATA") == "1"
++            ):
++                conv_metadata = None
+             Bx = causal_conv1d_fn(
+                 Bx_p,
+                 conv_weights,
+@@ -270,23 +506,158 @@ class ShortConv(MambaBase, CustomOp):
+                 conv_states=conv_state,
+                 has_initial_state=has_initial_states_p,
+                 cache_indices=state_indices_tensor_p,
+-                metadata=attn_metadata,
++                metadata=conv_metadata,
+                 query_start_loc=query_start_loc_p,
+             ).transpose(0, 1)[:num_prefill_tokens]
++            prefill_audit_dir = os.getenv("LFM2_DRAFT_PREFILL_STATE_AUDIT")
++            if (
++                prefill_audit_dir
++                and attn_metadata.draft_replay_canonical
++                and num_prefills == 1
++            ):
++                audit_step = getattr(self, "_lfm2_prefill_audit_step", 0)
++                slot = int(state_indices_tensor_p.flatten()[0].item())
++                os.makedirs(prefill_audit_dir, exist_ok=True)
++                torch.save(
++                    {
++                        "step": audit_step,
++                        "layer": self.layer_idx,
++                        "slot": slot,
++                        "has_initial": bool(has_initial_states_p[0].item()),
++                        "expected_tail": Bx_p[:, -conv_state.shape[-1] :]
++                        .detach()
++                        .cpu(),
++                        "actual_state": conv_state[slot].detach().cpu(),
++                    },
++                    os.path.join(
++                        prefill_audit_dir,
++                        f"layer{self.layer_idx:02d}_step{audit_step:03d}.pt",
++                    ),
++                )
++                self._lfm2_prefill_audit_step = audit_step + 1
+ 
+             y = C_p * Bx
+             conv_output_list.append(y)
+ 
+         if has_decode:
+             Bx_d = (B_d * x_d).contiguous()
+-            Bx = causal_conv1d_update(
+-                Bx_d,
+-                conv_state,
+-                conv_weights,
+-                self.conv.bias,
+-                activation=None,
+-                conv_state_indices=state_indices_tensor_d,
+-            )
++            assert state_indices_tensor_d is not None
++            state_dump_dir = os.getenv("LFM2_TARGET_STATE_DIR")
++            is_draft_replay = attn_metadata.draft_replay_canonical
++            if (
++                state_dump_dir
++                and not is_draft_replay
++            ):
++                debug_step = getattr(self, "_lfm2_debug_step", 0)
++                state_slot = int(state_indices_tensor_d[0, 0].item())
++                accepted = (
++                    1
++                    if attn_metadata.num_accepted_tokens is None
++                    else int(attn_metadata.num_accepted_tokens[0].item())
++                )
++                state = conv_state[state_slot]
++                state_width = state.shape[-1]
++                offset = accepted - 1
++                raw = state.as_strided(
++                    (state.shape[0], state_width + offset),
++                    state.stride(),
++                )
++                os.makedirs(state_dump_dir, exist_ok=True)
++                torch.save(
++                    {
++                        "step": debug_step,
++                        "layer": self.layer_idx,
++                        "accepted_offset": accepted,
++                        "state_slot": state_slot,
++                        "state": state.detach().cpu(),
++                        "effective_state": raw[
++                            :, offset : offset + state_width
++                        ].detach().cpu(),
++                        "bx": Bx_d.detach().cpu(),
++                        "query_start_loc": (
++                            None
++                            if attn_metadata.query_start_loc_d is None
++                            else attn_metadata.query_start_loc_d.detach().cpu()
++                        ),
++                    },
++                    os.path.join(
++                        state_dump_dir,
++                        f"layer{self.layer_idx:02d}_step{debug_step:03d}.pt",
++                    ),
++                )
++                self._lfm2_debug_step = debug_step + 1
++            if attn_metadata.num_accepted_tokens is not None:
++                assert attn_metadata.query_start_loc_d is not None
++                canonical_draft_replay = attn_metadata.draft_replay_canonical
++                if canonical_draft_replay:
++                    use_oracle = os.getenv("LFM2_DRAFT_CONV_ORACLE") == "1"
++                    if use_oracle:
++                        qstarts = attn_metadata.query_start_loc_d.tolist()
++                        Bx_replayed = torch.empty_like(Bx_d)
++                        for req_idx, (start, end) in enumerate(
++                            zip(qstarts[:-1], qstarts[1:])
++                        ):
++                            state_index = state_indices_tensor_d[req_idx, :1]
++                            for token_idx in range(start, end):
++                                Bx_replayed[token_idx : token_idx + 1] = (
++                                    causal_conv1d_update(
++                                        Bx_d[token_idx : token_idx + 1],
++                                        conv_state,
++                                        conv_weights,
++                                        self.conv.bias,
++                                        activation=None,
++                                        conv_state_indices=state_index,
++                                    )
++                                )
++                        Bx = Bx_replayed
++                    elif os.getenv("LFM2_DRAFT_CONV_MATERIALIZED") == "1":
++                        Bx = materialized_draft_conv_replay(
++                            Bx_d,
++                            conv_state,
++                            conv_weights,
++                            self.conv.bias,
++                            state_indices_tensor_d,
++                            attn_metadata.query_start_loc_d,
++                        )
++                    elif os.getenv("LFM2_DRAFT_CONV_BATCHED") == "1":
++                        Bx = batched_draft_conv_replay(
++                            Bx_d,
++                            conv_state,
++                            conv_weights,
++                            self.conv.bias,
++                            state_indices_tensor_d,
++                            attn_metadata.query_start_loc_d,
++                        )
++                    else:
++                        Bx = specialized_draft_conv_replay(
++                            Bx_d,
++                            conv_state,
++                            conv_weights,
++                            self.conv.bias,
++                            state_indices_tensor_d,
++                            attn_metadata.query_start_loc_d,
++                        )
++                else:
++                    Bx = causal_conv1d_update(
++                        Bx_d,
++                        conv_state,
++                        conv_weights,
++                        self.conv.bias,
++                        activation=None,
++                        conv_state_indices=state_indices_tensor_d,
++                        num_accepted_tokens=attn_metadata.num_accepted_tokens,
++                        query_start_loc=attn_metadata.query_start_loc_d,
++                        max_query_len=state_indices_tensor_d.shape[1],
++                    )
++            else:
++                Bx = causal_conv1d_update(
++                    Bx_d,
++                    conv_state,
++                    conv_weights,
++                    self.conv.bias,
++                    activation=None,
++                    conv_state_indices=state_indices_tensor_d.flatten(),
++                )
+             y = C_d * Bx
+             conv_output_list.insert(0, y)
+ 
+diff --git a/vllm/v1/attention/backends/short_conv_attn.py b/vllm/v1/attention/backends/short_conv_attn.py
+index 9c85ec5..07c0dc9 100644
+--- a/vllm/v1/attention/backends/short_conv_attn.py
++++ b/vllm/v1/attention/backends/short_conv_attn.py
+@@ -25,7 +25,7 @@ class ShortConvAttentionBackend(AttentionBackend):
+ 
+ @dataclass
+ class ShortConvAttentionMetadata(BaseMambaAttentionMetadata):
+-    pass
++    draft_replay_canonical: bool = False
+ 
+ 
+ class ShortConvAttentionMetadataBuilder(
+diff --git a/vllm/v1/core/kv_cache_utils.py b/vllm/v1/core/kv_cache_utils.py
+index b13c23d..48d8477 100644
+--- a/vllm/v1/core/kv_cache_utils.py
++++ b/vllm/v1/core/kv_cache_utils.py
+@@ -1367,14 +1367,38 @@ def get_kv_cache_config_from_groups(
+         )
+     else:
+         # General case:
+-        # We will have group_size memory pools, each is shared by one layer from
+-        # each group. As layers of different groups have different block table,
+-        # they will use different parts of the shared Tensor.
++        # We will have one set of memory pools per model owner. Layers may
++        # share a tensor across cache groups owned by the same model, but
++        # target and draft groups must never share backing storage: their
++        # independently managed block-id namespaces can overlap.
+         # The memory layout for 3 groups (full.0, full.1), (sw.0, sw.2),
+         # (sw.1, padding) will be: (group_size = 2)
+         # full.0, sw.0, sw.1: share a Tensor with size=available_memory//2
+         # full.1, sw.2: share another Tensor with size=available_memory//2
+-        group_size = max(len(group.layer_names) for group in kv_cache_groups)
++        groups_by_owner: dict[str, list[KVCacheGroupSpec]] = defaultdict(list)
++        for group in kv_cache_groups:
++            first_layer = group.layer_names[0]
++            owner = (
++                "draft_model"
++                if first_layer.startswith("draft_model.")
++                else "target"
++            )
++            groups_by_owner[owner].append(group)
++        is_multi_model = "draft_model" in groups_by_owner
++        if is_multi_model:
++            # Generic hybrid drafting has independently managed block tables
++            # for every target/draft cache group. Do not alias their backing
++            # storage at all; overlapping physical block ids are valid across
++            # those independent namespaces.
++            group_size = sum(
++                len(group.layer_names) for group in kv_cache_groups
++            )
++        else:
++            owner_group_sizes = {
++                owner: max(len(group.layer_names) for group in groups)
++                for owner, groups in groups_by_owner.items()
++            }
++            group_size = sum(owner_group_sizes.values())
+ 
+         page_size = get_uniform_page_size(
+             [group.kv_cache_spec for group in kv_cache_groups]
+@@ -1384,14 +1408,29 @@ def get_kv_cache_config_from_groups(
+             vllm_config, group_size, available_memory, page_size
+         )
+         kv_cache_tensors = []
+-        for i in range(group_size):
+-            shared_by = []
+-            for j in range(len(kv_cache_groups)):
+-                if i < len(kv_cache_groups[j].layer_names):
+-                    shared_by.append(kv_cache_groups[j].layer_names[i])
+-            kv_cache_tensors.append(
+-                KVCacheTensor(size=page_size * num_blocks, shared_by=shared_by)
+-            )
++        if is_multi_model:
++            for group in kv_cache_groups:
++                for layer_name in group.layer_names:
++                    kv_cache_tensors.append(
++                        KVCacheTensor(
++                            size=page_size * num_blocks,
++                            shared_by=[layer_name],
++                        )
++                    )
++        else:
++            for owner, groups in groups_by_owner.items():
++                for i in range(owner_group_sizes[owner]):
++                    shared_by = [
++                        group.layer_names[i]
++                        for group in groups
++                        if i < len(group.layer_names)
++                    ]
++                    kv_cache_tensors.append(
++                        KVCacheTensor(
++                            size=page_size * num_blocks,
++                            shared_by=shared_by,
++                        )
++                    )
+ 
+     return KVCacheConfig(
+         num_blocks=num_blocks,
+@@ -1707,6 +1746,18 @@ def get_kv_cache_groups(
+     Returns:
+         The generated KVCacheGroups
+     """
++    if any(name.startswith("draft_model.") for name in kv_cache_spec):
++        owner_specs: dict[str, dict[str, KVCacheSpec]] = defaultdict(dict)
++        for name, spec in kv_cache_spec.items():
++            owner = "draft_model" if name.startswith("draft_model.") else "target"
++            owner_specs[owner][name] = spec
++        if len(owner_specs) > 1:
++            return [
++                group
++                for owner_spec in owner_specs.values()
++                for group in get_kv_cache_groups(vllm_config, owner_spec)
++            ]
++
+     if vllm_config.scheduler_config.disable_hybrid_kv_cache_manager:
+         unify_hybrid_kv_cache_specs(kv_cache_spec)
+ 
+diff --git a/vllm/v1/spec_decode/llm_base_proposer.py b/vllm/v1/spec_decode/llm_base_proposer.py
+index 756c5f3..916b121 100644
+--- a/vllm/v1/spec_decode/llm_base_proposer.py
++++ b/vllm/v1/spec_decode/llm_base_proposer.py
+@@ -1,6 +1,9 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ import dataclasses
++import json
++import os
++from copy import copy
+ from importlib.util import find_spec
+ from typing import TYPE_CHECKING, Any, cast
+ 
+@@ -36,6 +39,7 @@ from vllm.multimodal import MULTIMODAL_REGISTRY
+ from vllm.platforms import current_platform
+ from vllm.utils.torch_utils import PIN_MEMORY, async_tensor_h2d
+ from vllm.v1.attention.backend import CommonAttentionMetadata
++from vllm.v1.attention.backends.mamba_attn import BaseMambaAttentionMetadataBuilder
+ from vllm.v1.attention.backends.registry import AttentionBackendEnum
+ from vllm.v1.attention.backends.triton_attn import TritonAttentionMetadata
+ from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
+@@ -74,6 +78,7 @@ class SpecDecodeBaseProposer:
+         runner=None,
+     ):
+         self.vllm_config = vllm_config
++        self._lfm2_draft_trace_step = 0
+         assert vllm_config.speculative_config is not None
+         self.speculative_config = vllm_config.speculative_config
+         self.draft_model_config = self.speculative_config.draft_model_config
+@@ -151,6 +156,9 @@ class SpecDecodeBaseProposer:
+ 
+         self.draft_attn_groups: list[AttentionGroup] = []
+         self.kv_cache_gid: int = -1
++        self._per_group_cache_inputs: dict[
++            int, tuple[torch.Tensor, torch.Tensor]
++        ] = {}
+         self.eagle3_use_aux_hidden_state: bool = (
+             self._get_eagle3_use_aux_hidden_state_from_config()
+         )
+@@ -408,6 +416,24 @@ class SpecDecodeBaseProposer:
+         view = self._slot_mapping_buffer[:num_tokens]
+         return {name: view for name in self._draft_attn_layer_names}
+ 
++    def _get_per_layer_slot_mapping(
++        self,
++        num_tokens: int,
++    ) -> dict[str, torch.Tensor]:
++        """Materialize each draft cache group's physical slot mapping."""
++        group_mappings = self._lfm2_group_slot_mappings
++        result: dict[str, torch.Tensor] = {}
++        for gid, mapping in group_mappings.items():
++            buffer = self._lfm2_group_slot_mapping_buffers[gid]
++            num_actual = mapping.shape[0]
++            buffer[:num_actual].copy_(mapping)
++            if num_tokens > num_actual:
++                buffer[num_actual:num_tokens].fill_(PADDING_SLOT_ID)
++            view = buffer[:num_tokens]
++            for layer_name in self._lfm2_group_layers[gid]:
++                result[layer_name] = view
++        return result
++
+     def initialize_cudagraph_keys(self, cudagraph_mode: CUDAGraphMode) -> None:
+         """Initialize cudagraph dispatcher keys for the drafter.
+ 
+@@ -518,8 +544,19 @@ class SpecDecodeBaseProposer:
+         slot_mappings: dict[str, torch.Tensor]
+         | list[dict[str, torch.Tensor]]
+         | None = None,
++        draft_input_mode: str | list[str] = "final",
+     ) -> torch.Tensor:
+-        self.num_speculative_tokens = num_speculative_tokens
++        draft_input_modes = (
++            draft_input_mode
++            if isinstance(draft_input_mode, list)
++            else [draft_input_mode] * common_attn_metadata.batch_size()
++        )
++        self._lfm2_current_draft_input_modes = draft_input_modes
++        self.num_speculative_tokens = (
++            0
++            if all(mode == "mid" for mode in draft_input_modes)
++            else num_speculative_tokens
++        )
+         self._last_draft_probs = None
+         batch_size = common_attn_metadata.batch_size()
+ 
+@@ -542,6 +579,20 @@ class SpecDecodeBaseProposer:
+             )
+             assert target_hidden_states.shape[-1] == self.hidden_size
+ 
++        trace_path = os.getenv("LFM2_DRAFT_TRACE")
++        trace_input = None
++        if trace_path:
++            trace_input = {
++                "kind": "proposer",
++                "step": self._lfm2_draft_trace_step,
++                "target_ids": target_token_ids.detach().cpu().tolist(),
++                "target_positions": target_positions.detach().cpu().tolist(),
++                "next_ids": next_token_ids.detach().cpu().tolist(),
++                "qstart_before": common_attn_metadata.query_start_loc.detach().cpu().tolist(),
++                "seq_lens_before": common_attn_metadata.seq_lens.detach().cpu().tolist(),
++                "rejected": None if num_rejected_tokens_gpu is None else num_rejected_tokens_gpu.detach().cpu().tolist(),
++                "draft_input_modes": draft_input_modes,
++            }
+         num_tokens, token_indices_to_sample, common_attn_metadata = (
+             self.set_inputs_first_pass(
+                 target_token_ids=target_token_ids,
+@@ -551,12 +602,82 @@ class SpecDecodeBaseProposer:
+                 token_indices_to_sample=token_indices_to_sample,
+                 cad=common_attn_metadata,
+                 num_rejected_tokens_gpu=num_rejected_tokens_gpu,
++                draft_input_mode=draft_input_mode,
+             )
+         )
+-
++        if trace_path and trace_input is not None:
++            trace_input.update({
++                "draft_input_ids": self.input_ids[:num_tokens].detach().cpu().tolist(),
++                "draft_positions": self._get_positions(num_tokens).detach().cpu().tolist(),
++                "sample_indices": token_indices_to_sample.detach().cpu().tolist(),
++                "qstart_after": common_attn_metadata.query_start_loc.detach().cpu().tolist(),
++                "seq_lens_after": common_attn_metadata.seq_lens.detach().cpu().tolist(),
++            })
++            self._lfm2_draft_trace_step += 1
++
++        draft_num_accepted_tokens = None
++        if any(mode == "decode" for mode in draft_input_modes):
++            query_lens = torch.diff(common_attn_metadata.query_start_loc)
++            decode_indices = torch.tensor(
++                [
++                    index
++                    for index, mode in enumerate(draft_input_modes)
++                    if mode == "decode"
++                ],
++                dtype=torch.long,
++                device=self.device,
++            )
++            draft_num_accepted_tokens = query_lens.index_select(
++                0, decode_indices
++            )
++            assert torch.all(
++                (draft_num_accepted_tokens == 1)
++                | (draft_num_accepted_tokens == 2)
++            ), "compacted k=1 draft rows must contain one or two committed tokens"
+         per_group_attn_metadata, per_layer_attn_metadata = (
+-            self.build_per_group_and_layer_attn_metadata(common_attn_metadata)
++            self.build_per_group_and_layer_attn_metadata(
++                common_attn_metadata,
++                num_accepted_tokens=draft_num_accepted_tokens,
++            )
+         )
++        if any(mode == "decode" for mode in draft_input_modes):
++            for metadata in per_group_attn_metadata:
++                state_d = getattr(metadata, "state_indices_tensor_d", None)
++                if state_d is not None and state_d.shape[1] > 1:
++                    # A generic draft has one persistent recurrent-state slot per
++                    # request. Speculative rows must update that same slot rather
++                    # than target-style per-position scratch slots.
++                    state_d[:, 1:].copy_(state_d[:, :1].expand_as(state_d[:, 1:]))
++        if trace_path and trace_input is not None:
++            groups = []
++            for gid, metadata in enumerate(per_group_attn_metadata):
++                state_d = getattr(metadata, "state_indices_tensor_d", None)
++                state_p = getattr(metadata, "state_indices_tensor_p", None)
++                groups.append({
++                    "gid": gid,
++                    "state_indices_d": (
++                        None if state_d is None else state_d.detach().cpu().tolist()
++                    ),
++                    "state_indices_p": (
++                        None if state_p is None else state_p.detach().cpu().tolist()
++                    ),
++                    "has_initial_states_p": (
++                        None
++                        if getattr(metadata, "has_initial_states_p", None) is None
++                        else metadata.has_initial_states_p.detach().cpu().tolist()
++                    ),
++                    "num_accepted_tokens": (
++                        None
++                        if getattr(metadata, "num_accepted_tokens", None) is None
++                        else metadata.num_accepted_tokens.detach().cpu().tolist()
++                    ),
++                })
++            trace_input["groups"] = groups
++            trace_input["primary_slot_mapping"] = (
++                common_attn_metadata.slot_mapping.detach().cpu().tolist()
++            )
++            with open(trace_path, "a", encoding="utf-8") as f:
++                f.write(json.dumps(trace_input) + "\n")
+ 
+         cudagraph_runtime_mode, num_input_tokens, num_tokens_across_dp = (
+             self._determine_batch_execution_and_padding(num_tokens)
+@@ -583,9 +704,7 @@ class SpecDecodeBaseProposer:
+             num_tokens=num_input_tokens,
+             num_tokens_across_dp=num_tokens_across_dp,
+             cudagraph_runtime_mode=cudagraph_runtime_mode,
+-            slot_mapping=self._get_slot_mapping(
+-                slot_mapping_size, common_attn_metadata.slot_mapping
+-            ),
++            slot_mapping=self._get_per_layer_slot_mapping(num_input_tokens),
+         ):
+             ret_hidden_states = self.model(**model_kwargs)
+             if not self.model_returns_tuple():
+@@ -594,6 +713,60 @@ class SpecDecodeBaseProposer:
+             else:
+                 last_hidden_states, hidden_states = ret_hidden_states
+ 
++        state_dump_dir = os.getenv("LFM2_DRAFT_STATE_DIR")
++        if state_dump_dir and trace_input is not None and batch_size == 1:
++            states = {}
++            modules = dict(self.model.named_modules())
++            from vllm.model_executor.layers.mamba.mamba_utils import (
++                is_conv_state_dim_first,
++            )
++
++            for attn_group, metadata in zip(
++                self.draft_attn_groups, per_group_attn_metadata
++            ):
++                state_slot = None
++                state_d = getattr(metadata, "state_indices_tensor_d", None)
++                if state_d is not None and state_d.numel() > 0:
++                    state_slot = int(state_d[0, 0].item())
++                else:
++                    state_p = getattr(metadata, "state_indices_tensor_p", None)
++                    if state_p is not None and state_p.numel() > 0:
++                        state_slot = int(state_p.flatten()[0].item())
++                if state_slot is None:
++                    continue
++                for name in attn_group.layer_names:
++                    module_name = (
++                        name.removeprefix("draft_model.")
++                        .removesuffix(".conv")
++                        + ".short_conv"
++                    )
++                    module = modules.get(module_name)
++                    if module is None:
++                        continue
++                    if type(module).__name__ != "ShortConv":
++                        continue
++                    cache = getattr(module, "kv_cache", None)
++                    if not cache:
++                        continue
++                    state = cache[0]
++                    if not is_conv_state_dim_first():
++                        state = state.transpose(-1, -2)
++                    states[module_name] = state[state_slot].detach().cpu()
++            if states:
++                os.makedirs(state_dump_dir, exist_ok=True)
++                torch.save(
++                    {
++                        "step": trace_input["step"],
++                        "positions": trace_input["draft_positions"],
++                        "input_ids": trace_input["draft_input_ids"],
++                        "states": states,
++                    },
++                    os.path.join(
++                        state_dump_dir,
++                        f"step_{trace_input['step']:03d}.pt",
++                    ),
++                )
++
+         # After step 0: switch to reuse mode so steps 1+ skip the indexer
+         # and read the indices that step 0 just wrote into the shared buffer.
+         if self._share_mtp_indices and hasattr(self.model.model, "set_skip_topk"):
+@@ -620,6 +793,18 @@ class SpecDecodeBaseProposer:
+             draft_token_ids, draft_probs = self._sample_draft_tokens(
+                 sample_hidden_states, sampling_metadata
+             )
++            if trace_path and trace_input is not None:
++                with open(trace_path, "a", encoding="utf-8") as f:
++                    f.write(
++                        json.dumps(
++                            {
++                                "kind": "proposal_output",
++                                "step": trace_input["step"],
++                                "token_ids": draft_token_ids.detach().cpu().tolist(),
++                            }
++                        )
++                        + "\n"
++                    )
+             if draft_probs is not None:
+                 self._last_draft_probs = draft_probs.view(
+                     -1, self.num_speculative_tokens, draft_probs.shape[-1]
+@@ -827,6 +1012,7 @@ class SpecDecodeBaseProposer:
+         token_indices_to_sample: torch.Tensor | None,
+         cad: CommonAttentionMetadata,
+         num_rejected_tokens_gpu: torch.Tensor | None,
++        draft_input_mode: str | list[str] = "final",
+     ) -> tuple[int, torch.Tensor, CommonAttentionMetadata]:
+         # Map target token IDs to draft vocab space (TLI algorithm)
+         if self.use_heterogeneous_vocab:
+@@ -835,6 +1021,22 @@ class SpecDecodeBaseProposer:
+                 target_token_ids
+             )
+             next_token_ids = self.vocab_mapping.map_target_to_draft_ids(next_token_ids)
++        draft_input_modes = (
++            draft_input_mode
++            if isinstance(draft_input_mode, list)
++            else [draft_input_mode] * cad.batch_size()
++        )
++        if all(mode == "mid" for mode in draft_input_modes):
++            # A partial prompt chunk has no sampled token. Advance draft caches
++            # through exactly the real prompt slice and emit no proposal.
++            num_tokens = target_token_ids.shape[0]
++            self.input_ids[:num_tokens] = target_token_ids
++            if self.uses_xdrope_dim > 0 and self.draft_uses_xdrope_dim == 0:
++                target_positions = target_positions[0]
++            self._set_positions(num_tokens, target_positions)
++            if self.pass_hidden_states_to_model:
++                self.hidden_states[:num_tokens] = target_hidden_states
++            return num_tokens, cad.query_start_loc[1:] - 1, cad
+         if not self.needs_extra_input_slots:
+             # Default EAGLE pathway: no reshaping of input tensors needed.
+             # Simply rotate the input ids and leave the positions unchanged,
+@@ -876,8 +1078,14 @@ class SpecDecodeBaseProposer:
+                 max_num_tokens_per_request + BLOCK_SIZE_TOKENS - 1
+             ) // BLOCK_SIZE_TOKENS
+             total_num_input_tokens = target_token_ids.shape[0]
++            shift_decode_inputs = all(
++                mode == "decode" for mode in draft_input_modes
++            )
++            net_new_slots = self.net_num_new_slots_per_request - int(
++                shift_decode_inputs
++            )
+             total_num_output_tokens = total_num_input_tokens + (
+-                self.net_num_new_slots_per_request * batch_size
++                net_new_slots * batch_size
+             )
+ 
+             token_indices_to_sample = torch.empty(
+@@ -919,7 +1127,10 @@ class SpecDecodeBaseProposer:
+                 # Note that we can deduce batch_size for free from the grid size
+                 total_input_tokens=total_num_input_tokens,
+                 num_padding_slots_per_request=self.extra_slots_per_request,
+-                shift_input_ids=self.pass_hidden_states_to_model,
++                shift_input_ids=(
++                    self.pass_hidden_states_to_model or shift_decode_inputs
++                ),
++                shift_positions=shift_decode_inputs,
+                 BLOCK_SIZE_TOKENS=BLOCK_SIZE_TOKENS,
+             )
+             if self.pass_hidden_states_to_model:
+@@ -934,6 +1145,190 @@ class SpecDecodeBaseProposer:
+                     out=self.hidden_states[:total_num_output_tokens],
+                 )
+ 
++            if isinstance(draft_input_mode, list):
++                assert len(draft_input_modes) == batch_size
++                original_query_lens = cad.naive_query_lens().detach().cpu().tolist()
++                rejected = (
++                    [0] * batch_size
++                    if num_rejected_tokens_gpu is None
++                    else num_rejected_tokens_gpu.detach().cpu().tolist()
++                )
++                expanded_starts = [0]
++                for query_len in original_query_lens:
++                    expanded_starts.append(
++                        expanded_starts[-1] + int(query_len) + 1
++                    )
++
++                keep_indices_cpu = []
++                row_lens_cpu = []
++                for req_idx, mode in enumerate(draft_input_modes):
++                    start = expanded_starts[req_idx]
++                    end = expanded_starts[req_idx + 1]
++                    if mode == "mid":
++                        row_start, row_end = start, end - 1
++                    elif mode == "final":
++                        row_start, row_end = start, end
++                    else:
++                        assert mode == "decode"
++                        keep_len = 2 - int(rejected[req_idx])
++                        row_start, row_end = end - keep_len, end
++                    keep_indices_cpu.extend(range(row_start, row_end))
++                    row_lens_cpu.append(row_end - row_start)
++
++                keep_indices = torch.tensor(
++                    keep_indices_cpu, dtype=torch.long, device=self.device
++                )
++                total_num_output_tokens = len(keep_indices_cpu)
++                self.input_ids[:total_num_output_tokens].copy_(
++                    self.input_ids.index_select(0, keep_indices)
++                )
++                compact_positions = self._get_positions(
++                    total_num_input_tokens + batch_size
++                ).index_select(-1, keep_indices)
++                self._set_positions(total_num_output_tokens, compact_positions)
++                if self.pass_hidden_states_to_model:
++                    self.hidden_states[:total_num_output_tokens].copy_(
++                        self.hidden_states.index_select(0, keep_indices)
++                    )
++                self.is_rejected_token_mask[:total_num_output_tokens].zero_()
++                self.is_masked_token_mask[:total_num_output_tokens].zero_()
++
++                query_start_cpu_values = [0]
++                for row_len in row_lens_cpu:
++                    query_start_cpu_values.append(
++                        query_start_cpu_values[-1] + row_len
++                    )
++                query_start_loc_cpu = torch.tensor(
++                    query_start_cpu_values, dtype=torch.int32
++                )
++                query_start_loc = query_start_loc_cpu.to(self.device)
++                token_indices_to_sample = query_start_loc[1:] - 1
++                seq_lens = (
++                    self._get_positions(total_num_output_tokens)
++                    .index_select(-1, token_indices_to_sample.long())
++                    .to(torch.int32)
++                    + 1
++                )
++                seq_lens_cpu = seq_lens.cpu()
++                row_lens_cpu_tensor = torch.tensor(
++                    row_lens_cpu, dtype=torch.int32
++                )
++                compact_cad = cad.replace(
++                    query_start_loc=query_start_loc,
++                    query_start_loc_cpu=query_start_loc_cpu,
++                    seq_lens=seq_lens,
++                    _seq_lens_cpu=seq_lens_cpu,
++                    _num_computed_tokens_cpu=(
++                        seq_lens_cpu - row_lens_cpu_tensor
++                    ),
++                    seq_lens_cpu_upper_bound=seq_lens_cpu,
++                    num_actual_tokens=total_num_output_tokens,
++                    max_query_len=max(row_lens_cpu),
++                    max_seq_len=int(seq_lens_cpu.max().item()),
++                )
++                new_slot_mapping = compute_new_slot_mapping(
++                    cad=compact_cad,
++                    new_positions=self._get_positions(total_num_output_tokens),
++                    is_rejected_token_mask=self.is_rejected_token_mask[
++                        :total_num_output_tokens
++                    ],
++                    block_size=self.block_size,
++                    num_new_tokens=0,
++                    max_model_len=self.max_model_len,
++                )
++                compact_cad = compact_cad.replace(
++                    slot_mapping=new_slot_mapping
++                )
++                return (
++                    total_num_output_tokens,
++                    token_indices_to_sample,
++                    compact_cad,
++                )
++
++            if shift_decode_inputs:
++                assert num_rejected_tokens_gpu is not None
++                target_query_lens = cad.naive_query_lens()
++                assert torch.all(target_query_lens == 2), (
++                    "k=1 generic draft decode expects two target verification rows"
++                )
++                rejected = num_rejected_tokens_gpu.detach().cpu().tolist()
++                row_lens_cpu = [2 - int(value) for value in rejected]
++                keep_indices_cpu = [
++                    2 * req + offset
++                    for req, row_len in enumerate(row_lens_cpu)
++                    for offset in range(row_len)
++                ]
++                keep_indices = torch.tensor(
++                    keep_indices_cpu, dtype=torch.long, device=self.device
++                )
++                total_num_output_tokens = len(keep_indices_cpu)
++                self.input_ids[:total_num_output_tokens].copy_(
++                    self.input_ids.index_select(0, keep_indices)
++                )
++                compact_positions = self._get_positions(
++                    total_num_input_tokens
++                ).index_select(-1, keep_indices)
++                self._set_positions(total_num_output_tokens, compact_positions)
++                if self.pass_hidden_states_to_model:
++                    self.hidden_states[:total_num_output_tokens].copy_(
++                        self.hidden_states.index_select(0, keep_indices)
++                    )
++                self.is_rejected_token_mask[:total_num_output_tokens].zero_()
++                self.is_masked_token_mask[:total_num_output_tokens].zero_()
++
++                query_start_cpu_values = [0]
++                for row_len in row_lens_cpu:
++                    query_start_cpu_values.append(
++                        query_start_cpu_values[-1] + row_len
++                    )
++                query_start_loc_cpu = torch.tensor(
++                    query_start_cpu_values, dtype=torch.int32
++                )
++                query_start_loc = query_start_loc_cpu.to(self.device)
++                token_indices_to_sample = query_start_loc[1:] - 1
++                seq_lens = (
++                    self._get_positions(total_num_output_tokens)
++                    .index_select(-1, token_indices_to_sample.long())
++                    .to(torch.int32)
++                    + 1
++                )
++                seq_lens_cpu = seq_lens.cpu()
++                row_lens_cpu_tensor = torch.tensor(
++                    row_lens_cpu, dtype=torch.int32
++                )
++                compact_cad = cad.replace(
++                    query_start_loc=query_start_loc,
++                    query_start_loc_cpu=query_start_loc_cpu,
++                    seq_lens=seq_lens,
++                    _seq_lens_cpu=seq_lens_cpu,
++                    _num_computed_tokens_cpu=(
++                        seq_lens_cpu - row_lens_cpu_tensor
++                    ),
++                    seq_lens_cpu_upper_bound=seq_lens_cpu,
++                    num_actual_tokens=total_num_output_tokens,
++                    max_query_len=max(row_lens_cpu),
++                    max_seq_len=int(seq_lens_cpu.max().item()),
++                )
++                assert self.block_size > 0
++                new_slot_mapping = compute_new_slot_mapping(
++                    cad=compact_cad,
++                    new_positions=self._get_positions(total_num_output_tokens),
++                    is_rejected_token_mask=self.is_rejected_token_mask[
++                        :total_num_output_tokens
++                    ],
++                    block_size=self.block_size,
++                    num_new_tokens=0,
++                    max_model_len=self.max_model_len,
++                )
++                compact_cad = compact_cad.replace(
++                    slot_mapping=new_slot_mapping
++                )
++                return (
++                    total_num_output_tokens,
++                    token_indices_to_sample,
++                    compact_cad,
++                )
++
+             # 2.
+             # Recompute the slot mapping based on the new positions and
+             # rejection mask.
+@@ -945,18 +1340,17 @@ class SpecDecodeBaseProposer:
+                     :total_num_output_tokens
+                 ],
+                 block_size=self.block_size,
+-                num_new_tokens=self.net_num_new_slots_per_request,
++                num_new_tokens=net_new_slots,
+                 max_model_len=self.max_model_len,
+             )
+ 
+             # 3. Update the common attention metadata with the new (meta)data
+             new_cad = extend_all_queries_by_N(
+                 cad,
+-                N=self.net_num_new_slots_per_request,
++                N=net_new_slots,
+                 arange=self.arange,
+                 new_slot_mapping=new_slot_mapping,
+             )
+-
+             return total_num_output_tokens, token_indices_to_sample, new_cad
+ 
+     def build_model_inputs_first_pass(
+@@ -991,19 +1385,82 @@ class SpecDecodeBaseProposer:
+         return model_kwargs, num_input_tokens
+ 
+     def build_per_group_and_layer_attn_metadata(
+-        self, common_attn_metadata: CommonAttentionMetadata, draft_index: int = 0
++        self,
++        common_attn_metadata: CommonAttentionMetadata,
++        draft_index: int = 0,
++        num_accepted_tokens: torch.Tensor | None = None,
+     ) -> tuple[list[object], dict[str, object]]:
+         per_group_attn_metadata: list[object] = []
+         per_layer_attn_metadata: dict[str, object] = {}
++        self._lfm2_group_slot_mappings = {}
+         for attn_group in self.draft_attn_groups:
+-            attn_metadata = attn_group.get_metadata_builder().build_for_drafting(
+-                common_attn_metadata=common_attn_metadata, draft_index=draft_index
++            group_metadata = copy(common_attn_metadata)
++            gid = attn_group.kv_cache_group_id
++            # The runner's common metadata belongs to a target-model cache
++            # group. Every draft group, including the draft "primary" group,
++            # must replace both the block table and slot mapping with its own
++            # cache inputs. Reusing the target primary mapping silently writes
++            # draft KV into unrelated physical blocks.
++            block_table, runner_slot_mapping = self._per_group_cache_inputs[gid]
++            num_active_reqs = group_metadata.query_start_loc.numel() - 1
++            # Cache-input buffers are capacity-sized, while common metadata
++            # describes only requests active in this step. Keep the row count
++            # aligned with naive_query_lens() for mixed/admission batches.
++            group_metadata.block_table_tensor = block_table[:num_active_reqs]
++            group_block_size = (
++                attn_group.get_metadata_builder().kv_cache_spec.block_size
+             )
++            modes = getattr(self, "_lfm2_current_draft_input_modes", [])
++            if modes and all(mode == "mid" for mode in modes):
++                group_metadata.slot_mapping = runner_slot_mapping[
++                    : group_metadata.num_actual_tokens
++                ]
++            else:
++                group_metadata.slot_mapping = compute_new_slot_mapping(
++                    cad=group_metadata,
++                    new_positions=self.positions[
++                        : group_metadata.num_actual_tokens
++                    ],
++                    is_rejected_token_mask=self.is_rejected_token_mask[
++                        : group_metadata.num_actual_tokens
++                    ],
++                    block_size=group_block_size,
++                    num_new_tokens=0,
++                    max_model_len=self.max_model_len,
++                )
++            builder = attn_group.get_metadata_builder()
++            if (
++                num_accepted_tokens is not None
++                and isinstance(builder, BaseMambaAttentionMetadataBuilder)
++            ):
++                attn_metadata = builder.build(
++                    common_prefix_len=0,
++                    common_attn_metadata=group_metadata,
++                    fast_build=True,
++                    num_accepted_tokens=num_accepted_tokens,
++                )
++                if hasattr(attn_metadata, "draft_replay_canonical"):
++                    attn_metadata.draft_replay_canonical = True
++            else:
++                attn_metadata = builder.build_for_drafting(
++                    common_attn_metadata=group_metadata, draft_index=draft_index
++                )
++                if hasattr(attn_metadata, "draft_replay_canonical"):
++                    attn_metadata.draft_replay_canonical = True
++            self._lfm2_group_slot_mappings[gid] = group_metadata.slot_mapping
+             per_group_attn_metadata.append(attn_metadata)
+             for layer_name in attn_group.layer_names:
+                 per_layer_attn_metadata[layer_name] = attn_metadata
+         return per_group_attn_metadata, per_layer_attn_metadata
+ 
++    def set_per_group_attn_metadata(
++        self,
++        kv_cache_gid: int,
++        block_table: torch.Tensor,
++        slot_mapping: torch.Tensor,
++    ) -> None:
++        self._per_group_cache_inputs[kv_cache_gid] = (block_table, slot_mapping)
++
+     def model_returns_tuple(self) -> bool:
+         if self.method == "mtp":
+             # DeepSeek-family MTP (deepseek_mtp.py) recycles the post-final-
+@@ -1153,6 +1610,7 @@ class SpecDecodeBaseProposer:
+             slot_mapping=common_attn_metadata.slot_mapping[:total_num_tokens],
+             causal=True,
+             dcp_local_seq_lens=common_attn_metadata.dcp_local_seq_lens,
++            is_prefilling=common_attn_metadata.is_prefilling,
+         )
+ 
+         return (
+@@ -1264,6 +1722,7 @@ class SpecDecodeBaseProposer:
+             slot_mapping=common_attn_metadata.slot_mapping[token_indices],
+             causal=True,
+             dcp_local_seq_lens=common_attn_metadata.dcp_local_seq_lens,
++            is_prefilling=common_attn_metadata.is_prefilling,
+         )
+ 
+         return spec_common_attn_metadata, token_indices
+@@ -1393,7 +1852,6 @@ class SpecDecodeBaseProposer:
+ 
+         self._maybe_share_embeddings(target_language_model)
+         self._maybe_share_lm_head(target_language_model)
+-
+         if (
+             self.parallel_drafting
+             and self.pass_hidden_states_to_model
+@@ -1537,12 +1995,38 @@ class SpecDecodeBaseProposer:
+                     "Keeping separate lm_head weights from the target model."
+                 )
+         else:
+-            # MTP model
+-            share_lm_head = True
+-            logger.info(
+-                "Detected MTP model. "
+-                "Sharing target model lm_head weights with the draft model."
+-            )
++            # A regular draft model also lacks the EAGLE-only
++            # ``has_own_lm_head`` marker. It must retain its own head, which
++            # may have a different hidden width from the target model.
++            if self.method == "mtp":
++                share_lm_head = True
++                logger.info(
++                    "Detected MTP model. "
++                    "Sharing target model lm_head weights with the draft model."
++                )
++            else:
++                logger.info(
++                    "Generic draft model detected. Keeping its own lm_head weights."
++                )
++
++        if share_lm_head and hasattr(target_language_model, "lm_head"):
++            target_head = target_language_model.lm_head
++            draft_head = getattr(self.model, "lm_head", None)
++            target_weight = getattr(target_head, "weight", None)
++            draft_weight = getattr(draft_head, "weight", None)
++            if isinstance(target_weight, torch.Tensor) and isinstance(
++                draft_weight, torch.Tensor
++            ):
++                target_dim = target_weight.shape[-1]
++                draft_dim = draft_weight.shape[-1]
++                if target_dim != draft_dim:
++                    share_lm_head = False
++                    logger.warning(
++                        "Target lm_head dim (%d) differs from draft lm_head "
++                        "dim (%d). Keeping separate lm_head weights.",
++                        target_dim,
++                        draft_dim,
++                    )
+ 
+         if share_lm_head and hasattr(target_language_model, "lm_head"):
+             if hasattr(self.model, "lm_head"):
+@@ -1679,28 +2163,21 @@ class SpecDecodeBaseProposer:
+             use_aux_hidden_state = eagle_config.get("use_aux_hidden_state", True)
+         return use_aux_hidden_state
+ 
+-    def validate_same_kv_cache_group(self, kv_cache_config: KVCacheConfig) -> None:
+-        """
+-        Validate that all drafting layers belong to the same KVCacheGroup.
+-        Need this assumption to ensure all drafting layers can use the
+-        same AttentionMetadata.
+-        May extend to multiple AttentionMetadata in the future.
+-        """
++    def get_draft_kv_cache_groups(
++        self, kv_cache_config: KVCacheConfig
++    ) -> dict[str, int]:
++        """Map every drafting layer to its allocated KV-cache group."""
+         kv_cache_groups: dict[str, int] = {}
+         for id, kv_cache_group in enumerate(kv_cache_config.kv_cache_groups):
+             for layer_name in kv_cache_group.layer_names:
+                 kv_cache_groups[layer_name] = id
+-        assert (
+-            len(
+-                set(
+-                    [
+-                        kv_cache_groups[layer_name]
+-                        for layer_name in self._draft_attn_layer_names
+-                    ]
+-                )
+-            )
+-            == 1
+-        ), "All drafting layers should belong to the same kv cache group"
++        draft_group_mapping = {
++            layer_name: kv_cache_groups.get(layer_name)
++            for layer_name in sorted(self._draft_attn_layer_names)
++        }
++        missing = [name for name, gid in draft_group_mapping.items() if gid is None]
++        assert not missing, f"Drafting layers have no KV-cache group: {missing}"
++        return {name: gid for name, gid in draft_group_mapping.items() if gid is not None}
+ 
+     def initialize_attn_backend(
+         self,
+@@ -1716,21 +2193,19 @@ class SpecDecodeBaseProposer:
+             AttentionLayerBase,  # type: ignore[type-abstract]
+         )
+ 
+-        # Find which kv_cache_group the draft layers belong to
+-        self.validate_same_kv_cache_group(kv_cache_config)
+-        kv_cache_spec = None
++        draft_group_mapping = self.get_draft_kv_cache_groups(kv_cache_config)
++        attention_groups: dict[tuple[int, str], AttentionGroup] = {}
+         for gid, group in enumerate(kv_cache_config.kv_cache_groups):
+-            if self._draft_attn_layer_names & set(group.layer_names):
+-                self.kv_cache_gid = gid
+-                kv_cache_spec = group.kv_cache_spec
+-                break
+-
+-        attention_groups: dict[tuple[str, str], AttentionGroup] = {}
+-        if kv_cache_spec is not None:
+-            for layer_name in self._draft_attn_layer_names:
++            draft_layers = self._draft_attn_layer_names & set(group.layer_names)
++            if not draft_layers:
++                continue
++            kv_cache_spec = group.kv_cache_spec
++            for layer_name in draft_layers:
++                assert draft_group_mapping[layer_name] == gid
+                 attn_backend = all_attn_layers[layer_name].get_attn_backend()
+                 backend_key = attn_backend.full_cls_name()
+-                if backend_key not in attention_groups:
++                group_key = (gid, backend_key)
++                if group_key not in attention_groups:
+                     layer_kv_cache_spec = kv_cache_spec
+                     if isinstance(layer_kv_cache_spec, UniformTypeKVCacheSpecs):
+                         layer_kv_cache_spec = layer_kv_cache_spec.kv_cache_specs[
+@@ -1738,31 +2213,57 @@ class SpecDecodeBaseProposer:
+                         ]
+ 
+                     kernel_block_size = (
+-                        kernel_block_sizes[self.kv_cache_gid]
++                        kernel_block_sizes[gid]
+                         if kernel_block_sizes is not None
+-                        and self.kv_cache_gid < len(kernel_block_sizes)
++                        and gid < len(kernel_block_sizes)
+                         else None
+                     )
+                     attn_group = AttentionGroup(
+                         backend=attn_backend,
+                         layer_names=[layer_name],
+                         kv_cache_spec=layer_kv_cache_spec,
+-                        kv_cache_group_id=self.kv_cache_gid,
++                        kv_cache_group_id=gid,
+                     )
+                     attn_group.create_metadata_builders(
+                         self.vllm_config,
+                         self.device,
+                         kernel_block_size=kernel_block_size,
+                     )
+-                    attention_groups[backend_key] = attn_group
++                    attention_groups[group_key] = attn_group
+                 else:
+-                    attention_groups[backend_key].layer_names.append(layer_name)
++                    attention_groups[group_key].layer_names.append(layer_name)
+ 
+         self.draft_attn_groups = list(attention_groups.values())
+-        self.block_size = (
+-            self.draft_attn_groups[0].get_metadata_builder().kv_cache_spec.block_size
++        assert self.draft_attn_groups, "No drafting cache groups were initialized"
++        self._lfm2_group_layers: dict[int, list[str]] = {}
++        for group in self.draft_attn_groups:
++            self._lfm2_group_layers.setdefault(group.kv_cache_group_id, []).extend(
++                group.layer_names
++            )
++        self._lfm2_group_slot_mapping_buffers = {
++            gid: torch.full_like(self._slot_mapping_buffer, PADDING_SLOT_ID)
++            for gid in self._lfm2_group_layers
++        }
++        block_sizes = {
++            group.get_metadata_builder().kv_cache_spec.block_size
++            for group in self.draft_attn_groups
++        }
++        # Position-to-slot expansion is used only for extra autoregressive draft
++        # passes. k=1 exits before that path; retain the paged-attention block
++        # size instead of rejecting a one-state-per-request ShortConv group.
++        self.block_size = min(block_sizes)
++        self.kv_cache_gid = next(
++            group.kv_cache_group_id
++            for group in self.draft_attn_groups
++            if group.get_metadata_builder().kv_cache_spec.block_size == self.block_size
++        )
++        logger.info(
++            "Initialized multi-group drafter cache metadata: groups=%d, "
++            "logical_block_sizes=%s, expansion_block_size=%d",
++            len(self.draft_attn_groups),
++            sorted(block_sizes),
++            self.block_size,
+         )
+-        logger.debug("Using block size %d for drafting layers", self.block_size)
+ 
+     def _determine_batch_execution_and_padding(
+         self,
+diff --git a/vllm/v1/spec_decode/utils.py b/vllm/v1/spec_decode/utils.py
+index 65b9408..7ddabf0 100644
+--- a/vllm/v1/spec_decode/utils.py
++++ b/vllm/v1/spec_decode/utils.py
+@@ -326,6 +326,7 @@ def copy_and_expand_eagle_inputs_kernel(
+     total_input_tokens,  # tl.int32
+     num_padding_slots_per_request,  # tl.int32
+     shift_input_ids,  # tl.bool
++    shift_positions,  # tl.bool
+     BLOCK_SIZE_TOKENS: tl.constexpr,  # Blocks along token dim to handle prefills
+ ):
+     """
+@@ -412,9 +413,10 @@ def copy_and_expand_eagle_inputs_kernel(
+     # Positions are NOT shifted - they start from the first input position and increment
+     # Output position j gets start_pos + j
+     # (e.g., input positions [5,6,7] -> output [5,6,7,8,9,...])
+-    positions = start_pos + j
++    positions = start_pos + j + tl.where(shift_positions, 1, 0)
+     # Rejected positions are don't-care, set to 0
+-    positions = tl.where(is_rejected_region, 0, positions)
++    # Keep padding positions monotonic. Their cache writes are suppressed by
++    # PADDING_SLOT_ID, but position-derived model logic must not see position 0.
+ 
+     # Compute output masks
+     is_rejected_out = is_rejected_region & in_bounds
+diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
+index e9b23f1..72d88ff 100644
+--- a/vllm/v1/worker/gpu_model_runner.py
++++ b/vllm/v1/worker/gpu_model_runner.py
+@@ -4,6 +4,8 @@
+ import functools
+ import gc
+ import itertools
++import json
++import os
+ import threading
+ import time
+ from collections import defaultdict
+@@ -136,6 +138,9 @@ from vllm.v1.attention.backends.linear_attn import (
+     BailingLinearAttentionMetadataBuilder,
+ )
+ from vllm.v1.attention.backends.mamba2_attn import Mamba2AttentionMetadataBuilder
++from vllm.v1.attention.backends.short_conv_attn import (
++    ShortConvAttentionMetadataBuilder,
++)
+ from vllm.v1.attention.backends.utils import (
+     NULL_BLOCK_ID,
+     create_fast_prefill_custom_backend,
+@@ -925,6 +930,8 @@ class GPUModelRunner(
+         self.kv_connector_output: KVConnectorOutput | None = None
+         self.mamba_state_idx: dict[str, int] = {}
+         self._mamba_bufs: mamba_utils.MambaBuffers | None = None
++        self._draft_mamba_bufs: mamba_utils.MambaBuffers | None = None
++        self.draft_mamba_state_idx: dict[str, int] = {}
+         self.mamba_prev_last_scheduled_idx: CpuGpuBuffer | None = None
+         if self.cache_config.mamba_cache_mode == "all" and self.num_spec_tokens > 0:
+             self.mamba_prev_last_scheduled_idx = self._make_buffer(
+@@ -1034,6 +1041,10 @@ class GPUModelRunner(
+         # decode + hybrid model.
+         assert self.cache_config.mamba_cache_mode == "align"
+         if self._mamba_bufs is None:
++            excluded_layer_names = None
++            drafter = getattr(self, "drafter", None)
++            if isinstance(drafter, DraftModelProposer):
++                excluded_layer_names = drafter._draft_attn_layer_names
+             self._mamba_bufs = mamba_utils.MambaBuffers.create(
+                 max_num_reqs=self.max_num_reqs,
+                 kv_cache_config=self.kv_cache_config,
+@@ -1043,9 +1054,31 @@ class GPUModelRunner(
+                 with_postprocess_align=(
+                     self.speculative_config is not None and self.model_config.is_hybrid
+                 ),
++                excluded_layer_names=excluded_layer_names,
+             )
+         return self._mamba_bufs
+ 
++    def _get_draft_mamba_bufs(self) -> mamba_utils.MambaBuffers:
++        assert isinstance(self.drafter, DraftModelProposer)
++        if self._draft_mamba_bufs is None:
++            draft_layers = self.drafter._draft_attn_layer_names
++            target_layers = {
++                name
++                for group in self.kv_cache_config.kv_cache_groups
++                for name in group.layer_names
++                if name not in draft_layers
++            }
++            self._draft_mamba_bufs = mamba_utils.MambaBuffers.create(
++                max_num_reqs=self.max_num_reqs,
++                kv_cache_config=self.kv_cache_config,
++                copy_funcs=self.drafter.model.get_mamba_state_copy_func(),
++                make_buffer=self._make_buffer,
++                device=self.device,
++                with_postprocess_align=False,
++                excluded_layer_names=target_layers,
++            )
++        return self._draft_mamba_bufs
++
+     def _init_model_kwargs(self):
+         model_kwargs = dict[str, Any]()
+ 
+@@ -1538,7 +1571,6 @@ class GPUModelRunner(
+         # tokens gives us the first -1 position (i.e., number of accepted).
+         num_reqs = output_token_ids.size(0)
+         self.num_accepted_tokens.gpu[:num_reqs] = (output_token_ids != -1).sum(dim=1)
+-
+         if self.cache_config.mamba_cache_mode == "align":
+             # Fused GPU postprocess: state copies + per-request accepted-token
+             # update without CPU-GPU sync. The metadata
+@@ -2449,6 +2481,7 @@ class GPUModelRunner(
+                 builder,
+                 (
+                     Mamba2AttentionMetadataBuilder,
++                    ShortConvAttentionMetadataBuilder,
+                     GDNAttentionMetadataBuilder,
+                     BailingLinearAttentionMetadataBuilder,
+                 ),
+@@ -2532,10 +2565,15 @@ class GPUModelRunner(
+                 ):
+                     if self.drafter.kv_cache_gid == kv_cache_gid:
+                         spec_decode_common_attn_metadata = cm
++                elif isinstance(self.drafter, DraftModelProposer):
++                    if self.drafter.kv_cache_gid == kv_cache_gid:
++                        spec_decode_common_attn_metadata = cm
+                 else:
+                     spec_decode_common_attn_metadata = cm
+             # Capture per-group block tables for multi-group proposers.
+-            if self.speculative_config and isinstance(self.drafter, Step3p5MTPProposer):
++            if self.speculative_config and isinstance(
++                self.drafter, (Step3p5MTPProposer, DraftModelProposer)
++            ):
+                 self.drafter.set_per_group_attn_metadata(
+                     kv_cache_gid, cm.block_table_tensor, cm.slot_mapping
+                 )
+@@ -4240,6 +4278,19 @@ class GPUModelRunner(
+                     self.model.get_mamba_state_copy_func(),
+                     mamba_bufs.preprocess,
+                 )
++                if isinstance(getattr(self, "drafter", None), DraftModelProposer):
++                    draft_bufs = self._get_draft_mamba_bufs()
++                    mamba_utils.preprocess_mamba(
++                        scheduler_output,
++                        self.kv_cache_config,
++                        self.cache_config,
++                        self.draft_mamba_state_idx,
++                        self.input_batch,
++                        self.requests,
++                        self.drafter.vllm_config.compilation_config.static_forward_context,
++                        self.drafter.model.get_mamba_state_copy_func(),
++                        draft_bufs.preprocess,
++                    )
+                 # preprocess_mamba resets num_accepted_tokens_cpu to 1
+                 # for requests whose state was copied to a new block.
+                 # Re-sync to GPU so the mamba kernel reads from the
+@@ -4488,12 +4539,29 @@ class GPUModelRunner(
+                 scheduler_output, grammar_output, self.input_batch, logits
+             )
+ 
++        target_trace = os.getenv("LFM2_TARGET_LOGITS_TRACE")
++        target_trace_row = None
++        if target_trace and logits is not None:
++            top_values, top_ids = torch.topk(logits.float(), k=5, dim=-1)
++            target_trace_row = {
++                "logits_shape": list(logits.shape),
++                "top_ids": top_ids.detach().cpu().tolist(),
++                "top_logits": top_values.detach().cpu().tolist(),
++                "scheduled": dict(scheduler_output.num_scheduled_tokens),
++            }
++
+         with record_function_or_nullcontext("gpu_model_runner: sample"):
+             sampler_output = self._sample(logits, spec_decode_metadata)
+ 
+         self._update_states_after_model_execute(
+             sampler_output.sampled_token_ids, scheduler_output
+         )
++        if target_trace_row is not None:
++            target_trace_row["sampled"] = (
++                sampler_output.sampled_token_ids.detach().cpu().tolist()
++            )
++            with open(target_trace, "a", encoding="utf-8") as trace_file:
++                trace_file.write(json.dumps(target_trace_row) + "\n")
+         if self.use_async_scheduling:
+             pp = get_pp_group()
+             # For torchrun external_launcher PP mode with broadcast_pp_output=True,
+@@ -5094,6 +5162,26 @@ class GPUModelRunner(
+                         self.discard_request_mask.gpu,
+                     )
+                 )
++                if trace_path := os.getenv("LFM2_DRAFT_TRACE"):
++                    rows = []
++                    for i, req_id in enumerate(self.input_batch.req_ids):
++                        req = self.requests[req_id]
++                        rows.append({
++                            "req_id": req_id,
++                            "nc": int(req.num_computed_tokens),
++                            "ns": int(scheduler_output.num_scheduled_tokens[req_id]),
++                            "prompt_len": int(req.num_prompt_tokens),
++                            "total_len": int(req.num_tokens),
++                            "discard": bool(self.discard_request_mask.np[i]),
++                        })
++                    with open(trace_path, "a", encoding="utf-8") as f:
++                        f.write(json.dumps({
++                            "kind": "runner",
++                            "rows": rows,
++                            "sampled": sampled_token_ids.detach().cpu().tolist(),
++                            "next_ids": next_token_ids.detach().cpu().tolist(),
++                            "valid_counts": valid_sampled_tokens_count.detach().cpu().tolist(),
++                        }) + "\n")
+                 self._copy_valid_sampled_token_count(
+                     next_token_ids, valid_sampled_tokens_count
+                 )
+@@ -5168,6 +5256,26 @@ class GPUModelRunner(
+             else:
+                 mm_embed_inputs = None
+ 
++            draft_rows = []
++            for req_id in self.input_batch.req_ids:
++                req = self.requests[req_id]
++                nc = req.num_computed_tokens
++                ns = scheduler_output.num_scheduled_tokens[req_id]
++                if nc + ns < req.num_prompt_tokens:
++                    draft_rows.append("mid")
++                elif nc < req.num_prompt_tokens:
++                    draft_rows.append("final")
++                else:
++                    draft_rows.append("decode")
++            if all(mode == "mid" for mode in draft_rows):
++                draft_input_mode = "mid"
++            elif all(mode == "decode" for mode in draft_rows):
++                draft_input_mode = "decode"
++            elif all(mode == "final" for mode in draft_rows):
++                draft_input_mode = "final"
++            else:
++                draft_input_mode = draft_rows
++
+             draft_token_ids = self.drafter.propose(
+                 num_speculative_tokens=num_spec_tokens_to_schedule,
+                 target_token_ids=target_token_ids,
+@@ -5180,12 +5288,20 @@ class GPUModelRunner(
+                 mm_embed_inputs=mm_embed_inputs,
+                 num_rejected_tokens_gpu=num_rejected_tokens_gpu,
+                 slot_mappings=slot_mappings,
++                draft_input_mode=draft_input_mode,
+             )
+             if hasattr(self.drafter, "take_last_draft_probs"):
+                 draft_probs = self.drafter.take_last_draft_probs()
+                 if draft_probs is not None:
+                     self._draft_probs = draft_probs
+                     self._draft_prob_req_ids = self.input_batch.req_ids.copy()
++            if isinstance(draft_input_mode, list):
++                assert isinstance(draft_token_ids, torch.Tensor)
++                draft_rows_cpu = draft_token_ids.detach().cpu().tolist()
++                draft_token_ids = [
++                    [] if mode == "mid" else row
++                    for mode, row in zip(draft_input_mode, draft_rows_cpu)
++                ]
+ 
+         return draft_token_ids
+ 
+@@ -7416,6 +7532,8 @@ class GPUModelRunner(
+         kv_cache_config = deepcopy(kv_cache_config)
+         self.kv_cache_config = kv_cache_config
+         self._mamba_bufs = None
++        self._draft_mamba_bufs = None
++        self.draft_mamba_state_idx.clear()
+         self.may_add_encoder_only_layers_to_kv_cache_config()
+         self.maybe_add_kv_sharing_layers_to_kv_cache_groups(kv_cache_config)
+         self.initialize_attn_backend(kv_cache_config, is_profiling=is_profiling)
+diff --git a/vllm/v1/worker/mamba_utils.py b/vllm/v1/worker/mamba_utils.py
+index 8d8d3e6..ee05555 100644
+--- a/vllm/v1/worker/mamba_utils.py
++++ b/vllm/v1/worker/mamba_utils.py
+@@ -2,6 +2,8 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ import dataclasses
+ import itertools
++import json
++import os
+ from collections.abc import Callable
+ from typing import Any
+ 
+@@ -408,11 +410,23 @@ def batch_memcpy(src_ptrs, dst_ptrs, sizes):
+     batch_memcpy_kernel[grid](src_ptrs, dst_ptrs, sizes, BLOCK_SIZE=BLOCK_SIZE)
+ 
+ 
+-def get_mamba_groups(kv_cache_config: KVCacheConfig) -> tuple[list[int], MambaSpec]:
++def get_mamba_groups(
++    kv_cache_config: KVCacheConfig,
++    excluded_layer_names: set[str] | None = None,
++) -> tuple[list[int], MambaSpec]:
+     mamba_group_ids: list[int] = []
+     mamba_specs: list[MambaSpec] = []
+     for i in range(len(kv_cache_config.kv_cache_groups)):
+-        kv_cache_spec = kv_cache_config.kv_cache_groups[i].kv_cache_spec
++        group = kv_cache_config.kv_cache_groups[i]
++        if excluded_layer_names:
++            excluded = set(group.layer_names) & excluded_layer_names
++            assert not excluded or excluded == set(group.layer_names), (
++                "target and draft Mamba layers share one KV-cache group: "
++                f"{group.layer_names}"
++            )
++            if excluded:
++                continue
++        kv_cache_spec = group.kv_cache_spec
+         if isinstance(kv_cache_spec, MambaSpec):
+             mamba_group_ids.append(i)
+             mamba_specs.append(kv_cache_spec)
+@@ -437,8 +451,11 @@ class MambaCopyBuffers:
+         kv_cache_config: KVCacheConfig,
+         copy_funcs: tuple[MambaStateCopyFunc, ...],
+         make_buffer: Callable[..., CpuGpuBuffer],
++        excluded_layer_names: set[str] | None = None,
+     ) -> "MambaCopyBuffers":
+-        mamba_group_ids, mamba_spec = get_mamba_groups(kv_cache_config)
++        mamba_group_ids, mamba_spec = get_mamba_groups(
++            kv_cache_config, excluded_layer_names
++        )
+         entries_per_req = sum(
+             len(kv_cache_config.kv_cache_groups[gid].layer_names)
+             for gid in mamba_group_ids
+@@ -518,9 +535,12 @@ class MambaSpecDecodeGPUContext:
+         num_state_types: int,
+         device: torch.device,
+         make_buffer: Callable[..., CpuGpuBuffer],
++        excluded_layer_names: set[str] | None = None,
+     ) -> "MambaSpecDecodeGPUContext":
+         """Create context with allocated buffers (metadata populated later)."""
+-        mamba_group_ids, mamba_spec = get_mamba_groups(kv_cache_config)
++        mamba_group_ids, mamba_spec = get_mamba_groups(
++            kv_cache_config, excluded_layer_names
++        )
+ 
+         # Count total layers across all mamba groups
+         num_layers = sum(
+@@ -864,10 +884,15 @@ class MambaBuffers:
+         make_buffer: Callable[..., CpuGpuBuffer],
+         device: torch.device,
+         with_postprocess_align: bool,
++        excluded_layer_names: set[str] | None = None,
+     ) -> "MambaBuffers":
+         return cls(
+             preprocess=MambaCopyBuffers.create(
+-                max_num_reqs, kv_cache_config, copy_funcs, make_buffer
++                max_num_reqs,
++                kv_cache_config,
++                copy_funcs,
++                make_buffer,
++                excluded_layer_names,
+             ),
+             postprocess_align=(
+                 MambaSpecDecodeGPUContext.create(
+@@ -876,6 +901,7 @@ class MambaBuffers:
+                     num_state_types=len(copy_funcs),
+                     device=device,
+                     make_buffer=make_buffer,
++                    excluded_layer_names=excluded_layer_names,
+                 )
+                 if with_postprocess_align
+                 else None
+@@ -975,6 +1001,8 @@ def preprocess_mamba(
+     cleanup_mamba_state_idx(scheduler_output, mamba_state_idx)
+ 
+     copy_bufs.offset = 0
++    trace_path = os.getenv("LFM2_MAMBA_COPY_TRACE")
++    trace_rows: list[dict[str, Any]] = []
+     for i, req_id in enumerate(input_batch.req_ids):
+         req_state = requests[req_id]
+         prev_state_idx = mamba_state_idx.get(req_id)
+@@ -1002,6 +1030,42 @@ def preprocess_mamba(
+         curr_state_idx = num_blocks - 1 - num_speculative_blocks
+         mamba_state_idx[req_id] = curr_state_idx
+         if prev_state_idx != -1 and prev_state_idx != curr_state_idx:
++            if trace_path:
++                groups = []
++                for group_id in mamba_group_ids:
++                    block_ids = req_state.block_ids[group_id]
++                    layer_names = kv_cache_config.kv_cache_groups[group_id].layer_names
++                    state = forward_context[layer_names[0]].kv_cache[0]
++                    groups.append(
++                        {
++                            "group_id": group_id,
++                            "owner": (
++                                "draft"
++                                if layer_names[0].startswith("draft_model.")
++                                else "target"
++                            ),
++                            "layer": layer_names[0],
++                            "src_block_idx": prev_state_idx,
++                            "dst_block_idx": curr_state_idx,
++                            "src_block_id": block_ids[prev_state_idx],
++                            "dst_block_id": block_ids[curr_state_idx],
++                            "src_sum": float(
++                                state[block_ids[prev_state_idx]].float().sum().item()
++                            ),
++                        }
++                    )
++                trace_rows.append(
++                    {
++                        "req_id": req_id,
++                        "num_computed_tokens": req_state.num_computed_tokens,
++                        "num_scheduled_tokens": num_scheduled_tokens,
++                        "block_size": block_size,
++                        "accepted_token_bias": (
++                            int(input_batch.num_accepted_tokens_cpu[i]) - 1
++                        ),
++                        "groups": groups,
++                    }
++                )
+             collect_mamba_copy_meta(
+                 copy_bufs,
+                 kv_cache_config,
+@@ -1015,6 +1079,17 @@ def preprocess_mamba(
+             )
+             input_batch.num_accepted_tokens_cpu[i] = 1
+     do_mamba_copy_block(copy_bufs)
++    if trace_path and trace_rows:
++        torch.cuda.synchronize()
++        for row in trace_rows:
++            for group in row["groups"]:
++                state = forward_context[group["layer"]].kv_cache[0]
++                group["dst_sum"] = float(
++                    state[group["dst_block_id"]].float().sum().item()
++                )
++        with open(trace_path, "a", encoding="utf-8") as trace_file:
++            for row in trace_rows:
++                trace_file.write(json.dumps(row) + "\n")
+ 
+ 
+ def postprocess_mamba_all(

@@ -11,7 +11,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/* \
     && pip install --no-cache-dir xxhash
 
-COPY submission/patches/vllm-0.25.1-lfm2-draft-prefix-v9.patch /tmp/lfm2-draft.patch
+COPY submission/patches/vllm-0.25.1-lfm2-draft-prefix-v10.patch /tmp/lfm2-draft.patch
 
 RUN site_packages="$(python3 -c 'import pathlib, vllm; print(pathlib.Path(vllm.__file__).parent.parent)')" \
     && patch -d "${site_packages}" -p1 < /tmp/lfm2-draft.patch \

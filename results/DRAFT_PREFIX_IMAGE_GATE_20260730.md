@@ -63,19 +63,20 @@ byte identity.
 
 ## Decision
 
-**IMAGE-READY for one official screening slot.**
+**Correctness-ready but performance-rejected after the REP30 campaign.**
 
 The mechanism gate is above the pre-registered 1.35 tokens/step threshold,
 prefix reuse is active, CUDA graph replay is deterministic, mixed requests
-complete, and local VRAM remains below 10 GiB. Absolute ERS and latency remain
-unknown until the H200 grader run.
+complete, and local VRAM remains below 10 GiB. A later anchor-interleaved
+REP30 campaign nevertheless measured a roughly 4.5x TPOT regression for both
+BF16 and FP8 drafts. Do not submit this image as a performance candidate.
 
 ## Submission package
 
 - Patch:
-  `submission/patches/vllm-0.25.1-lfm2-draft-prefix-v9.patch`
+  `submission/patches/vllm-0.25.1-lfm2-draft-prefix-v10.patch`
   - SHA256:
-    `2f2adc8cb7bc683cbfba4be61eb9a6584eac3c082a5eb5a226aadb87b2539ebb`
+    `fd1e7d977c62d4d2e120c97441cd786e72339e1dc1e40ddb3493860eb174f8a1`
 - Dockerfile:
   `submission/Dockerfile.fp8-v0251-draft350m-k1-prefix-v2`
 - Compose:
